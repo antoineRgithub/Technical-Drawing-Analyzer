@@ -8,9 +8,14 @@ computes an estimated manufacturing cost.
 """
 
 from __future__ import annotations
-
+from transformers import AutoProcessor, AutoModelForCausalLM 
+import torch
+import argparse
+import pandas as pd
 import os
-
+import cv2
+import numpy as np
+from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
 import streamlit as st
 from dotenv import load_dotenv
 
@@ -19,9 +24,14 @@ from modules.cost_calculator import (
     CostParameters,
     estimate_cost,
     MATERIAL_DB,
+    lookup_material,
 )
-from modules.pdf_processor import load_pdf
+from modules.plan_analysis import (load_florence2, run_florence2_ocr, extract_dimensions_from_text, run_vqa_questions)
+from modules.pdf_processor import load_pdf, preprocess_image_for_ocr
+from modules.AI_analysis import return_thickness, return_length, return_height, return_number_of_bendings, return_number_of_holes
 
+from modules.RAG import extract_entities
+from modules.qwen_chat import ask_qwen
 # ---------------------------------------------------------------------------
 # Environment
 # ---------------------------------------------------------------------------
@@ -36,37 +46,48 @@ st.set_page_config(
     layout="wide",
 )
 
+@st.cache_resource
+def load_model():
+    print("Loading Qwen... (only once)")
+    model = Qwen3VLForConditionalGeneration.from_pretrained(
+        "Qwen/Qwen3-VL-2B-Instruct",
+        torch_dtype="auto",
+        device_map="auto"
+    )
+
+    processor = AutoProcessor.from_pretrained(
+        "Qwen/Qwen3-VL-2B-Instruct"
+    )
+    print("Qwen loaded !")
+
+    return model, processor
+
+model, processor = load_model()
 # ---------------------------------------------------------------------------
 # Sidebar — configuration
 # ---------------------------------------------------------------------------
 with st.sidebar:
     st.title("⚙️ Configuration")
 
-    # API key
-    api_key = st.text_input(
-        "OpenAI API Key",
-        value=os.getenv("OPENAI_API_KEY", ""),
-        type="password",
-        help="Provide your OpenAI API key. It is never stored.",
-    )
 
     st.divider()
     st.subheader("Cost Parameters")
 
+
     hourly_rate = st.number_input(
-        "CNC Hourly Rate (€/h)", min_value=10.0, max_value=500.0, value=65.0, step=5.0
+        "Taux horaire (€/h)", min_value=10.0, max_value=500.0, value=40.0, step=5.0
     )
     setup_time = st.number_input(
-        "Setup Time (h)", min_value=0.0, max_value=8.0, value=0.5, step=0.25
+        "Temps de préparation (h)", min_value=0.0, max_value=2.0, value=0.5, step=0.1
     )
     overhead_rate = st.slider(
-        "Overhead Rate (%)", min_value=0, max_value=60, value=25
+        "Taux de coûts indirects (%)", min_value=0, max_value=60, value=25
     ) / 100.0
     margin_rate = st.slider(
-        "Profit Margin (%)", min_value=0, max_value=60, value=15
+        "Taux de marge (%)", min_value=0, max_value=60, value=15
     ) / 100.0
     quantity = st.number_input(
-        "Quantity", min_value=1, max_value=10_000, value=1, step=1,
+        "Quantité", min_value=1, max_value=10_000, value=1, step=1,
         help="Overrides the quantity found in the drawing.",
     )
 
@@ -78,10 +99,10 @@ with st.sidebar:
     )
 
     st.divider()
-    st.subheader("Material Override")
-    material_override = st.selectbox(
-        "Force material (optional)",
-        options=["(use drawing value)"] + list(MATERIAL_DB.keys()),
+    st.subheader("Material")
+    material = st.selectbox(
+        "Sélectionnez un matériau",
+        options= list(MATERIAL_DB.keys()),
     )
 
     st.divider()
@@ -94,6 +115,10 @@ with st.sidebar:
 # Main area
 # ---------------------------------------------------------------------------
 st.title("📐 Industrial Technical Drawing Analyser")
+print("gpu available:", torch.cuda.is_available())
+print(torch.__version__)
+print(torch.cuda.get_device_name(0))
+print(torch.cuda.get_device_capability(0))
 st.markdown(
     "Upload a **PDF technical drawing** of a machined part. "
     "The app will extract all text, analyse the schematic with GPT-4o, "
@@ -120,16 +145,17 @@ with st.spinner("Reading PDF…"):
 
 st.success(f"Loaded **{doc.filename}** — {len(doc.pages)} page(s)")
 
-tab_pages, tab_text, tab_analysis, tab_cost = st.tabs(
-    ["📄 Pages", "📝 Extracted Text", "🔍 AI Analysis", "💶 Cost Estimate"]
+tab_pages, tab_text, tab_analysis, tab_cost, sandbag, sandbag2 = st.tabs(
+    ["📄 Pages", "📝 Extracted Text", "🔍 AI Analysis", "💶 Cost Estimate", "OCR (text)", "OCR (drawing)" ]
 )
 
 
 def _apply_sidebar_overrides(analysis) -> None:
     """Apply sidebar material and quantity overrides to an analysis object in-place."""
-    if material_override != "(use drawing value)":
-        analysis.material = material_override
-    analysis.quantity = int(quantity)
+    if material != "(use drawing value)":
+        analysis["material"] = material
+    
+    analysis["quantity"] = int(quantity)
 
 # ---------------------------------------------------------------------------
 # Tab 1 – Page images
@@ -145,6 +171,111 @@ with tab_pages:
                     caption=f"Page {page.page_number}",
                     use_container_width=True,
                 )
+
+with sandbag:
+    img = doc.pages[0].img
+    
+    width, height = img.size
+
+    # left half
+    left_img = img.crop((0, 0, width // 2, height))
+
+    # right half
+    right_img = img.crop((width // 2, 0, width, height))
+
+    # Crop the top and the bottom of right_img
+    middle_right_img = right_img.crop((0, height * 0.35, width // 2, height * 0.85))
+    top_right_img = right_img.crop((0, 0, width // 2, height * 0.35))
+    cols = st.columns(2)
+    with cols[0]:
+        
+        st.markdown("**Preprocessed Text Region**")
+        st.image(middle_right_img, caption="Preprocessed Text Region", use_container_width=True)
+    with cols[1]:
+        
+        st.markdown("**Preprocessed Drawing Region**")
+        st.image(top_right_img, caption="Preprocessed Drawing Region", use_container_width=True)
+    
+    text = doc.pages[0].text.strip()
+    st.markdown("**OCR Extracted Text**")
+    st.text_area("Extracted Text", value=text, height=200)
+
+    labels = ["BENDING RADIUS",
+              "UNDIMENSIONNED RADIUS",
+              "ISO",
+              "Relevant instructions",
+              "constraints",]
+    
+    rag_extract = st.button("▶ Extract entities with RAG", type="primary")
+    if rag_extract:
+        entities = extract_entities(text, labels)
+    
+
+        st.markdown("**Extracted Entities**")
+        st.markdown(entities)
+        rows = []
+
+        for key, values in entities["entities"].items():
+            if values:
+                for v in values:
+                    rows.append({"Field": key, "Value": v})
+            else:
+                rows.append({"Field": key, "Value": None})
+
+        df = pd.DataFrame(rows)
+
+        st.dataframe(df, use_container_width=True)
+
+with sandbag2:
+    st.markdown("**OCR on the drawing**")
+    img = doc.pages[0].img
+    
+    width, height = img.size
+
+    # left half
+    left_img = img.crop((0, 0, width // 2, height))
+
+    # middle of left half
+    middle_left_img = left_img.crop((0, height * 0.45, width // 2, height * 0.65))
+    top_left_img = left_img.crop((0, 0, width // 2, height * 0.45))
+    bottom_left_img = left_img.crop((0, height * 0.65, width // 2, height))
+
+    st.image(top_left_img, caption="Drawing Region", use_container_width=True)
+    
+    st.session_state.messages = []
+
+    user_question = st.text_input("Ask something about the image:")
+    send = st.button("Send")
+
+    
+    if user_question and top_left_img is not None and send:
+        print("asking qwen ...")
+        answer = ask_qwen(
+            top_left_img,
+            user_question, 
+            model,
+            processor,
+        )
+        print(f"Qwen answer: {answer}")
+        # store chat history
+        st.session_state.messages.append(("You", user_question))
+        st.session_state.messages.append(("Qwen", answer))
+
+    print(st.session_state.messages)
+    # ----------------------------
+    # Display chat history
+    # ----------------------------
+    for role, msg in st.session_state.messages:
+        if role == "You":
+            st.markdown(f"🧑 **You:** {msg}")
+        else:
+            st.markdown(f"🤖 **Qwen:** {msg}")
+
+    st.markdown("**Qwen-VL analysis of the drawing**")
+    # st.text_area("Qwen-VL Output", value=output_text[0], height=200)
+    
+
+
 
 # ---------------------------------------------------------------------------
 # Tab 2 – Extracted text
@@ -166,82 +297,119 @@ with tab_text:
 # Tab 3 – AI analysis
 # ---------------------------------------------------------------------------
 with tab_analysis:
-    if not api_key:
-        st.warning("Please enter your OpenAI API Key in the sidebar to run the analysis.")
-        st.stop()
 
     run_analysis = st.button("▶ Run AI Analysis", type="primary")
 
+    cols = st.columns(2)
+    with cols[1]:
+        st.markdown("**Drawing to analyze**")
+        st.image(left_img, caption="Drawing to analyze")
+
     if "analysis" not in st.session_state:
-        st.session_state.analysis = None
+        st.session_state.analysis = {}
 
     if run_analysis:
-        with st.spinner("Sending document to GPT-4o… This may take 15–60 s."):
-            try:
-                analysis = analyse_document(doc, api_key=api_key)
-                st.session_state.analysis = analysis
-            except Exception as exc:
-                st.error(f"Analysis failed: {exc}")
-                st.stop()
+        with cols[0]:
+                with st.spinner("Analyzing document with Qwen-VL… This may take 1–10 s."):
+                    thickness = return_thickness(doc.pages[0].img, model, processor)
+                    st.session_state.analysis['thickness'] = thickness
+                    length = return_length(doc.pages[0].img, model, processor)
+                    st.session_state.analysis['length'] = length
+                    height = return_height(doc.pages[0].img, model, processor)
+                    st.session_state.analysis['height'] = height
+                    st.session_state.analysis['volume'] = int(height) * int(length) * int(thickness)
+                    estimated_mass = st.session_state.analysis['volume'] / 1_000_000 * MATERIAL_DB[material][0] # volume in m3 * density in g/m3
+                    st.session_state.analysis['estimated_mass'] = estimated_mass
+                    st.session_state.analysis['number_of_bendings'] = return_number_of_bendings(doc.pages[0].img, model, processor)[0]
+                    # st.session_state.analysis['bending_angle'] = return_number_of_bendings(doc.pages[0].img, model, processor)[1]
+                    st.session_state.analysis['number_of_holes'] = return_number_of_holes(doc.pages[0].img, model, processor)
+                analysis = st.session_state.analysis
 
-    analysis = st.session_state.analysis
+                if analysis == {}:
+                    st.info("Click **Run AI Analysis** to extract information from the drawing.")
+                else:
 
-    if analysis is None:
-        st.info("Click **Run AI Analysis** to extract information from the drawing.")
-    else:
-        _apply_sidebar_overrides(analysis)
+                    col_info, col_dims = st.columns([1, 2])
 
-        col_info, col_dims = st.columns([1, 2])
+                    
+                    st.subheader("Analysed Drawing Information")
+                    rows = [
+                        {
+                            "Dimensions": "Thickness",
+                            "Value": analysis['thickness'] + "mm",
+                        },
+                        {
+                            "Dimensions": "Length",
+                            "Value": analysis['length'] + "mm",
+                        },
+                        {
+                            "Dimensions": "Height",
+                            "Value": analysis['height'] + "mm",
+                        },
+                        
+                    ]
+                    st.dataframe(rows, use_container_width=True, hide_index=True)
 
-        with col_info:
-            st.subheader("Part Information")
-            st.markdown(f"**Part Name:** {analysis.part_name}")
-            st.markdown(f"**Material:** {analysis.material}")
-            st.markdown(f"**Surface Finish:** {analysis.surface_finish}")
-            st.markdown(f"**Heat Treatment:** {analysis.heat_treatment}")
-            st.markdown(f"**Quantity:** {analysis.quantity}")
+                    rows2 = [
+                        {
+                            "Features": "Bendings",
+                            "Quantity": analysis['number_of_bendings'],
+                        },
+                        {
+                            "Features": "Holes",
+                            "Quantity": analysis['number_of_holes'],
+                        },
+                    ]
+                    st.dataframe(rows2, use_container_width=True, hide_index=True)
+                    st.markdown(f"**Estimated Volume:** {analysis['volume']} mm³")
+                    st.markdown(f"**Estimated Mass:** {analysis['estimated_mass']:.2f} g (using density of {material})")
+    #         if analysis.notes:
+    #             st.subheader("Notes")
+    #             for note in analysis.notes:
+    #                 st.markdown(f"- {note}")
 
-            if analysis.notes:
-                st.subheader("Notes")
-                for note in analysis.notes:
-                    st.markdown(f"- {note}")
+    #     with col_dims:
+    #         st.subheader("Extracted Dimensions")
+    #         if analysis.dimensions:
+    #             rows = [
+    #                 {
+    #                     "Name": d.name,
+    #                     "Value": d.value,
+    #                     "Unit": d.unit,
+    #                     "Tol +": d.tolerance_plus if d.tolerance_plus is not None else "—",
+    #                     "Tol −": d.tolerance_minus if d.tolerance_minus is not None else "—",
+    #                 }
+    #                 for d in analysis.dimensions
+    #             ]
+    #             st.dataframe(rows, use_container_width=True, hide_index=True)
+    #         else:
+    #             st.info("No dimensions were extracted.")
 
-        with col_dims:
-            st.subheader("Extracted Dimensions")
-            if analysis.dimensions:
-                rows = [
-                    {
-                        "Name": d.name,
-                        "Value": d.value,
-                        "Unit": d.unit,
-                        "Tol +": d.tolerance_plus if d.tolerance_plus is not None else "—",
-                        "Tol −": d.tolerance_minus if d.tolerance_minus is not None else "—",
-                    }
-                    for d in analysis.dimensions
-                ]
-                st.dataframe(rows, use_container_width=True, hide_index=True)
-            else:
-                st.info("No dimensions were extracted.")
-
-        with st.expander("Raw JSON response from GPT-4o"):
-            st.json(analysis.raw_json)
+    #     with st.expander("Raw JSON response from GPT-4o"):
+    #         st.json(analysis.raw_json)
 
 # ---------------------------------------------------------------------------
 # Tab 4 – Cost estimate
 # ---------------------------------------------------------------------------
 with tab_cost:
-    analysis = st.session_state.get("analysis")
+    
+    cost_analysis = st.session_state.get("analysis")
 
-    if analysis is None:
-        st.info("Run the AI analysis first (tab **🔍 AI Analysis**).")
+    if cost_analysis== {}:
+        st.info("Run the AI cost_analysis first (tab **🔍 AI cost_analysis**).")
     else:
-        _apply_sidebar_overrides(analysis)
+        # run_cost = st.button("▶ Run Cost Estimate", type="primary")
+        # if not run_cost:
+        #     st.info("Click **Run Cost Estimate** to compute the manufacturing cost based on the extracted dimensions and material.")
+    #     st.stop()
+        _apply_sidebar_overrides(cost_analysis)
 
-        unit_cost = estimate_cost(analysis, params=cost_params)
+        unit_cost = estimate_cost(cost_analysis, params=cost_params)
         breakdown = unit_cost.as_dict()
         total_cost = breakdown.pop("TOTAL")
+        breakdown.pop("Temps de découpage (h)")
 
-        st.subheader("Unit Cost Breakdown")
+        st.subheader("Répartition des coûts :")
         col_chart, col_table = st.columns([1, 1])
 
         with col_chart:
@@ -252,15 +420,19 @@ with tab_cost:
                 st.metric(label=label, value=f"€ {value:,.2f}")
 
         st.divider()
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Unit Cost", f"€ {total_cost:,.2f}")
-        col2.metric("Quantity", str(analysis.quantity))
-        col3.metric(
-            "Total Order Cost",
-            f"€ {total_cost * analysis.quantity:,.2f}",
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Coût unitaire", f"€ {total_cost:,.2f}")
+        col2.metric("Temps d'usinage : ", f"{unit_cost.total_time_hours * 60:.2f} min")
+        col3.metric("Quantité", str(cost_analysis["quantity"]))
+        col4.metric(
+            "Coût total du devis",
+            f"€ {total_cost * cost_analysis['quantity']:,.2f}",
         )
+
 
         st.caption(
             "⚠️ These estimates are generated automatically from the drawing data and are "
             "indicative only. Always validate with a qualified engineer before quoting."
         )
+
+

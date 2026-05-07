@@ -64,10 +64,13 @@ HEAT_TREATMENT_COST: Dict[str, float] = {
 class CostBreakdown:
     material_cost: float = 0.0
     machining_cost: float = 0.0
+    # setup_cost: float = 0.0
+    overhead: float = 0.0
+    margin: float = 0.0
+    bending_cost: float = 0.0
+    holes_cost: float = 0.0
     setup_cost: float = 0.0
-    surface_treatment_cost: float = 0.0
-    heat_treatment_cost: float = 0.0
-    overhead_and_margin: float = 0.0
+    total_time_hours: float = 0.0
 
     @property
     def total(self) -> float:
@@ -75,20 +78,23 @@ class CostBreakdown:
             self.material_cost
             + self.machining_cost
             + self.setup_cost
-            + self.surface_treatment_cost
-            + self.heat_treatment_cost
-            + self.overhead_and_margin
+            + self.overhead
+            + self.margin
+            + self.bending_cost
+            + self.holes_cost
         )
 
     def as_dict(self) -> Dict[str, float]:
         return {
-            "Material":            round(self.material_cost, 2),
-            "Machining":           round(self.machining_cost, 2),
-            "Setup":               round(self.setup_cost, 2),
-            "Surface Treatment":   round(self.surface_treatment_cost, 2),
-            "Heat Treatment":      round(self.heat_treatment_cost, 2),
-            "Overhead & Margin":   round(self.overhead_and_margin, 2),
+            "Matériau":            round(self.material_cost, 2),
+            "Découpage":           round(self.machining_cost, 2),
+            "Pliage":           round(self.bending_cost, 2),
+            "Perçage":           round(self.holes_cost, 2),
+            "Préparation":               round(self.setup_cost, 2),
+            "Coûts indirects":            round(self.overhead, 2),
+            "Marge":              round(self.margin, 2),
             "TOTAL":               round(self.total, 2),
+            "Temps de découpage (h)": round(self.total_time_hours, 2),
         }
 
 
@@ -106,7 +112,7 @@ class CostParameters:
 
 
 def estimate_cost(
-    analysis: PartAnalysis,
+    analysis: dict,
     params: Optional[CostParameters] = None,
 ) -> CostBreakdown:
     """
@@ -120,47 +126,48 @@ def estimate_cost(
 
     cb = CostBreakdown()
 
+
     # --- 1. Material cost ---
-    density, mat_price = _lookup_material(analysis.material)
-    volume_cm3 = _estimate_volume_cm3(analysis)
+    density, mat_price = lookup_material(analysis['material'])
+    volume_cm3 = analysis['volume'] // 1000.0  # convert from mm³ to cm³
     volume_m3 = volume_cm3 / 1_000_000.0
     mass_kg = density * volume_m3
 
-    # Add 20 % stock allowance
-    cb.material_cost = mass_kg * mat_price * 1.20
+    print(f"Estimated mass: {mass_kg:.3f} kg (density={density} kg/m³, volume={volume_cm3:.1f} cm³)")
+
+    cb.material_cost = mass_kg * mat_price 
 
     # --- 2. Machining cost ---
-    machining_hours = _estimate_machining_hours(analysis, volume_cm3)
-    finish_mult = _surface_finish_multiplier(analysis.surface_finish)
-    cb.machining_cost = machining_hours * params.hourly_rate * finish_mult
+    cutting_hours = _estimate_cutting_hours(volume_cm3)
+    # finish_mult = _surface_finish_multiplier(analysis.surface_finish)
+    # cb.machining_cost = cutting_hours * params.hourly_rate * finish_mult
+    cb.machining_cost = cutting_hours * params.hourly_rate 
 
-    # --- 3. Setup cost ---
     cb.setup_cost = params.setup_time * params.hourly_rate
+    
 
-    # --- 4. Surface treatment ---
-    cb.surface_treatment_cost = _surface_treatment_cost(analysis.surface_finish)
+    cb.bending_cost = int(analysis['number_of_bendings']) * 5/60 * params.hourly_rate # we assume that each bending takes 5 minutes, we can adjust this value in the sidebar if needed 
+    cb.holes_cost = int(analysis['number_of_holes']) * 2/60 * params.hourly_rate # we assume that each hole takes 10 minutes, we can adjust this value in the sidebar if needed 
 
-    # --- 5. Heat treatment ---
-    cb.heat_treatment_cost = _heat_treatment_cost(analysis.heat_treatment)
+    cb.total_time_hours = params.setup_time + cutting_hours + int(analysis['number_of_bendings']) * 5/60 + int(analysis['number_of_holes']) * 2/60 # total time is the sum of cutting time, bending time and holes time
+
 
     # --- 6. Overhead + margin ---
     subtotal = (
         cb.material_cost
         + cb.machining_cost
+        + cb.bending_cost
+        + cb.holes_cost
         + cb.setup_cost
-        + cb.surface_treatment_cost
-        + cb.heat_treatment_cost
     )
-    cb.overhead_and_margin = subtotal * (params.overhead_rate + params.margin_rate)
-
+    cb.overhead = subtotal * params.overhead_rate
+    cb.margin = subtotal * params.margin_rate
     return cb
 
 
-# ---------------------------------------------------------------------------
-# Private helpers
-# ---------------------------------------------------------------------------
 
-def _lookup_material(material_str: str) -> tuple[float, float]:
+
+def lookup_material(material_str: str) -> tuple[float, float]:
     """Return (density, price_per_kg) for the closest known material."""
     material_str_lower = material_str.lower()
     for key, val in MATERIAL_DB.items():
@@ -168,57 +175,21 @@ def _lookup_material(material_str: str) -> tuple[float, float]:
             return val
     return MATERIAL_DB["Unknown"]
 
+# ---------------------------------------------------------------------------
+# Private helpers
+# ---------------------------------------------------------------------------
 
-def _estimate_volume_cm3(analysis: PartAnalysis) -> float:
+
+def _estimate_cutting_hours(volume_cm3: float) -> float:
     """
-    Estimate the bounding-box volume (cm³) of the part from extracted dimensions.
-    Converts all units to mm before computing volume.
-    """
-    dims_mm = {}
-    for dim in analysis.dimensions:
-        val_mm = _to_mm(dim.value, dim.unit)
-        name_lower = dim.name.lower()
-        # Try to identify length/width/height/diameter dimensions
-        if any(k in name_lower for k in ("length", "long", "hauteur", "height", "overall")):
-            dims_mm.setdefault("length", val_mm)
-        elif any(k in name_lower for k in ("width", "larg", "largeur")):
-            dims_mm.setdefault("width", val_mm)
-        elif any(k in name_lower for k in ("depth", "profond", "thickness", "épaisseur", "wall")):
-            dims_mm.setdefault("depth", val_mm)
-        elif any(k in name_lower for k in ("diameter", "diam", "ø", "od", "outer")):
-            dims_mm.setdefault("diameter", val_mm)
-        elif any(k in name_lower for k in ("radius", "rayon")):
-            dims_mm.setdefault("diameter", val_mm * 2)
-
-    if not dims_mm:
-        # No dimension data — return a small default volume (50×50×50 mm)
-        return 125.0
-
-    if "diameter" in dims_mm:
-        r = dims_mm["diameter"] / 2.0
-        h = dims_mm.get("length", dims_mm.get("depth", dims_mm["diameter"]))
-        volume_mm3 = math.pi * r * r * h
-    else:
-        length = dims_mm.get("length", 50.0)
-        width = dims_mm.get("width", length)
-        depth = dims_mm.get("depth", min(length, width) / 2.0)
-        volume_mm3 = length * width * depth
-
-    return volume_mm3 / 1000.0  # mm³ → cm³
-
-
-def _estimate_machining_hours(analysis: PartAnalysis, volume_cm3: float) -> float:
-    """
-    Estimate machining time in hours.
+    Estimate cutting time in hours.
     Heuristic: base time proportional to cube-root of volume,
     plus a bonus for each dimension (= complexity proxy).
     """
-    # Heuristic: base time scales with cube-root of volume (surface-area proxy),
-    # plus 0.05 h per dimension to account for geometric complexity (features count).
-    # The leading coefficient 0.1 is calibrated so a 125 cm³ block ≈ 0.5 h base time.
-    base_hours = 0.1 * (volume_cm3 ** (1 / 3))
-    complexity_bonus = len(analysis.dimensions) * 0.05  # 3 min per additional feature
-    return max(0.2, base_hours + complexity_bonus)
+    # Heuristic: base time scales with volume.
+    base_hours = (volume_cm3 * 0.8)/60
+    print(f"Estimated cutting hours: {base_hours:.2f} h (volume={volume_cm3:.1f} cm³)")
+    return base_hours
 
 
 def _to_mm(value: float, unit: str) -> float:
