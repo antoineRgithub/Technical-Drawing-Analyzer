@@ -41,7 +41,7 @@ load_dotenv()
 # Page config
 # ---------------------------------------------------------------------------
 st.set_page_config(
-    page_title="Technical Drawing Analyser",
+    page_title="Analyse de Plans Techniques",
     page_icon="⚙️",
     layout="wide",
 )
@@ -71,15 +71,15 @@ with st.sidebar:
 
 
     st.divider()
-    st.subheader("Cost Parameters")
+    st.subheader("Paramètres de coût")
 
 
     hourly_rate = st.number_input(
         "Taux horaire (€/h)", min_value=10.0, max_value=500.0, value=40.0, step=5.0
     )
     setup_time = st.number_input(
-        "Temps de préparation (h)", min_value=0.0, max_value=2.0, value=0.5, step=0.1
-    )
+        "Temps de préparation (min)", min_value=0, max_value=120, value=30, step=5
+    ) / 60 # convert to hours
     overhead_rate = st.slider(
         "Taux de coûts indirects (%)", min_value=0, max_value=60, value=25
     ) / 100.0
@@ -99,7 +99,7 @@ with st.sidebar:
     )
 
     st.divider()
-    st.subheader("Material")
+    st.subheader("Matériaux")
     material = st.selectbox(
         "Sélectionnez un matériau",
         options= list(MATERIAL_DB.keys()),
@@ -114,25 +114,25 @@ with st.sidebar:
 # ---------------------------------------------------------------------------
 # Main area
 # ---------------------------------------------------------------------------
-st.title("📐 Industrial Technical Drawing Analyser")
+st.title("📐 Etude de cas : outil d'analyse de plan techniques")
 print("gpu available:", torch.cuda.is_available())
 print(torch.__version__)
 print(torch.cuda.get_device_name(0))
 print(torch.cuda.get_device_capability(0))
 st.markdown(
-    "Upload a **PDF technical drawing** of a machined part. "
-    "The app will extract all text, analyse the schematic with GPT-4o, "
-    "identify dimensions and materials, and compute an estimated manufacturing cost."
+    "Chargez le **plan technique PDF** d'un composant. "
+    "L'application va extraire les dimensions et le texte du fichier,"
+    " et calculer une estimation du coût de fabrication."
 )
 
 uploaded_file = st.file_uploader(
-    "Drop your PDF here",
+    "Déposez votre PDF ici",
     type=["pdf"],
-    help="Multi-page PDFs are supported.",
+    help="Les PDFs multi-pages sont pris en charge.",
 )
 
 if uploaded_file is None:
-    st.info("Upload a PDF file to get started.")
+    st.info("Déposez un fichier PDF.")
     st.stop()
 
 # ---------------------------------------------------------------------------
@@ -140,13 +140,13 @@ if uploaded_file is None:
 # ---------------------------------------------------------------------------
 file_bytes = uploaded_file.read()
 
-with st.spinner("Reading PDF…"):
+with st.spinner("Lecture du PDF…"):
     doc = load_pdf(file_bytes, filename=uploaded_file.name, dpi=150)
 
 st.success(f"Loaded **{doc.filename}** — {len(doc.pages)} page(s)")
 
-tab_pages, tab_text, tab_analysis, tab_cost, sandbag, sandbag2 = st.tabs(
-    ["📄 Pages", "📝 Extracted Text", "🔍 AI Analysis", "💶 Cost Estimate", "OCR (text)", "OCR (drawing)" ]
+tab_pages, tab_text, tab_analysis, tab_cost, sandbag, chat = st.tabs(
+    ["📄 Pages", "📝 Texte extrait", "🔍 Analyse IA", "💶 Estimation des coûts", "OCR + RAG (Texte)", "Chat" ]
 )
 
 
@@ -186,6 +186,8 @@ with sandbag:
     # Crop the top and the bottom of right_img
     middle_right_img = right_img.crop((0, height * 0.35, width // 2, height * 0.85))
     top_right_img = right_img.crop((0, 0, width // 2, height * 0.35))
+
+    
     cols = st.columns(2)
     with cols[0]:
         
@@ -194,7 +196,7 @@ with sandbag:
     with cols[1]:
         
         st.markdown("**Preprocessed Drawing Region**")
-        st.image(top_right_img, caption="Preprocessed Drawing Region", use_container_width=True)
+        st.image(top_right_img, caption="Preprocessed Table Region", use_container_width=True)
     
     text = doc.pages[0].text.strip()
     st.markdown("**OCR Extracted Text**")
@@ -202,17 +204,15 @@ with sandbag:
 
     labels = ["BENDING RADIUS",
               "UNDIMENSIONNED RADIUS",
-              "ISO",
-              "Relevant instructions",
-              "constraints",]
+              "ISO",]
     
-    rag_extract = st.button("▶ Extract entities with RAG", type="primary")
+    rag_extract = st.button("▶ Extraire les entités avec le modèle RAG", type="primary")
     if rag_extract:
         entities = extract_entities(text, labels)
+        # print(f"Extracted entities: {entities}")
     
 
         st.markdown("**Extracted Entities**")
-        st.markdown(entities)
         rows = []
 
         for key, values in entities["entities"].items():
@@ -226,8 +226,8 @@ with sandbag:
 
         st.dataframe(df, use_container_width=True)
 
-with sandbag2:
-    st.markdown("**OCR on the drawing**")
+with chat:
+    st.markdown("** **")
     img = doc.pages[0].img
     
     width, height = img.size
@@ -240,7 +240,24 @@ with sandbag2:
     top_left_img = left_img.crop((0, 0, width // 2, height * 0.45))
     bottom_left_img = left_img.crop((0, height * 0.65, width // 2, height))
 
-    st.image(top_left_img, caption="Drawing Region", use_container_width=True)
+    image_choice = st.selectbox(
+        "Choose the image to chat with",
+        (
+            "Full left image",
+            "Top left image",
+            "Middle left image",
+            "Bottom left image",
+        ),
+    )
+
+    selected_chat_image = {
+        "Full left image": left_img,
+        "Top left image": top_left_img,
+        "Middle left image": middle_left_img,
+        "Bottom left image": bottom_left_img,
+    }[image_choice]
+
+    st.image(selected_chat_image, caption=image_choice, use_container_width=True)
     
     st.session_state.messages = []
 
@@ -248,10 +265,10 @@ with sandbag2:
     send = st.button("Send")
 
     
-    if user_question and top_left_img is not None and send:
+    if user_question and selected_chat_image is not None and send:
         print("asking qwen ...")
         answer = ask_qwen(
-            top_left_img,
+            selected_chat_image,
             user_question, 
             model,
             processor,
@@ -298,12 +315,12 @@ with tab_text:
 # ---------------------------------------------------------------------------
 with tab_analysis:
 
-    run_analysis = st.button("▶ Run AI Analysis", type="primary")
+    run_analysis = st.button("▶ Exécuter l'analyse IA", type="primary")
 
     cols = st.columns(2)
     with cols[1]:
-        st.markdown("**Drawing to analyze**")
-        st.image(left_img, caption="Drawing to analyze")
+        st.markdown("**Image à analyser**")
+        st.image(left_img, caption="Image à analyser")
 
     if "analysis" not in st.session_state:
         st.session_state.analysis = {}
@@ -326,25 +343,25 @@ with tab_analysis:
                 analysis = st.session_state.analysis
 
                 if analysis == {}:
-                    st.info("Click **Run AI Analysis** to extract information from the drawing.")
+                    st.info("Cliquez sur **Exécuter l'analyse IA** pour extraire les informations de la dessin.")
                 else:
 
                     col_info, col_dims = st.columns([1, 2])
 
                     
-                    st.subheader("Analysed Drawing Information")
+                    st.subheader("Analyse sur l'image")
                     rows = [
                         {
-                            "Dimensions": "Thickness",
-                            "Value": analysis['thickness'] + "mm",
+                            "Dimensions": "Epaisseur",
+                            "Valeur": analysis['thickness'] + "mm",
                         },
                         {
-                            "Dimensions": "Length",
-                            "Value": analysis['length'] + "mm",
+                            "Dimensions": "Longueur",
+                            "Valeur": analysis['length'] + "mm",
                         },
                         {
-                            "Dimensions": "Height",
-                            "Value": analysis['height'] + "mm",
+                            "Dimensions": "Hauteur",
+                            "Valeur": analysis['height'] + "mm",
                         },
                         
                     ]
@@ -352,12 +369,12 @@ with tab_analysis:
 
                     rows2 = [
                         {
-                            "Features": "Bendings",
-                            "Quantity": analysis['number_of_bendings'],
+                            "Features": "Pliages",
+                            "Quantité": analysis['number_of_bendings'],
                         },
                         {
-                            "Features": "Holes",
-                            "Quantity": analysis['number_of_holes'],
+                            "Features": "Trous",
+                            "Quantité": analysis['number_of_holes'],
                         },
                     ]
                     st.dataframe(rows2, use_container_width=True, hide_index=True)
@@ -416,8 +433,13 @@ with tab_cost:
             st.bar_chart(breakdown)
 
         with col_table:
+            # Present breakdown as a clean two-column table
+            rows = []
             for label, value in breakdown.items():
-                st.metric(label=label, value=f"€ {value:,.2f}")
+                rows.append({"Coût": label, "Montant": f"€ {value:,.2f}"})
+
+            # Use st.table for a compact, well-aligned display
+            st.table(rows)
 
         st.divider()
         col1, col2, col3, col4 = st.columns(4)
